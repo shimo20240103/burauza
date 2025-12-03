@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>M5StickC 足組み判定（合成値ベース版）</title>
+  <style>
+    body { font-family: 'Arial', sans-serif; background:#eaf7f3; color:#004d40; text-align:center; margin:0; padding:0; }
+    h1 { background:#a7ffeb; margin:0; padding:18px 0; border-bottom-left-radius:14px; border-bottom-right-radius:14px; }
+    .controls { margin:12px 0; }
+    button { font-size:15px; padding:8px 16px; margin:6px; border-radius:8px; border:none; background:#26a69a; color:#fff; cursor:pointer;}
+    #status1,#status2,#result,#calibStatus { margin-top:10px; font-weight:bold; font-size:18px; display:block; }
+    pre { display:inline-block; background:#b2dfdb; padding:8px 14px; border-radius:10px; margin-top:10px; }
+    .graph-container{ margin:18px auto; width:640px; }
+    canvas{ border:2px solid #004D40; border-radius:10px; background:#e0f2f1; display:block; margin:8px auto; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx/dist/xlsx.full.min.js"></script>
+</head>
+<body>
+<h1>M5StickC 足組み判定（合成値ベース版）</h1>
+<div class="controls">
+  <button id="connectBtn1" onclick="connect(1)">右足 接続</button>
+  <button id="connectBtn2" onclick="connect(2)">左足 接続</button>
+  <button onclick="startCalibration()">初期値キャリブレーション</button>
+  <button onclick="downloadExcel()">Excelダウンロード</button>
+</div>
+<!-- --- 表示エリア --- -->
+<div id="status1">右足: 未接続</div>
+<pre id="values1">Pitch:0.00 Roll:0.00 合成:0.00</pre>
+<div id="status2">左足: 未接続</div>
+<pre id="values2">Pitch:0.00 Roll:0.00 合成:0.00</pre>
+<div id="calibStatus">初期値: 未キャリブレーション</div>
+<div id="result">足組み状態: 不明</div>
+<!-- グラフ -->
+<div class="graph-container"><h2>右足 Pitch</h2><canvas id="graph1" width="640" height="140"></canvas></div>
+<div class="graph-container"><h2>左足 Pitch</h2><canvas id="graph2" width="640" height="140"></canvas></div>
+<script>
+/* =======================================
+   ★ 合成値（ベクトル値）判定用 閾値
+   ======================================= */
+const THRESH_15 = 24.524;  // 15組判定
+const THRESH_45 = 63.679;  // 45組判定
+const THRESH_90 = 90.0;    // 90組判定（必要に応じ調整）
+/* BLE UUID */
+const serviceUUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const charUUID    = "beb5483e-36e1-4688-b7f5-ea073f74076a";
+/* 最新 pitch/roll */
+let latestRight = [0,0];
+let latestLeft  = [0,0];
+/* Excel用データ */
+let accelData = [["Time","Right_P","Right_R","Right_Vec","Left_P","Left_R","Left_Vec","DiffVector","Crossed"]];
+let dataStore = {1:[],2:[]};
+const maxDataPoints = 300;
+/* キャリブレーション値 */
+let calibRight = {pitch:0, roll:0};
+let calibLeft  = {pitch:0, roll:0};
+let isCalibrated = false;
+let tempRight = [];
+let tempLeft  = [];
+/* ---- 合成値計算 ---- */
+function vector(p, r){
+  return Math.sqrt(p*p + r*r);
+}
+/* =======================================
+   ★ BLE接続
+   ======================================= */
+async function connect(id){
+  const btn = document.getElementById("connectBtn"+id);
+  btn.disabled = true;
+  try{
+    const device = await navigator.bluetooth.requestDevice({
+      acceptAllDevices:true,
+      optionalServices:[serviceUUID]
+    });
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(serviceUUID);
+    const char = await service.getCharacteristic(charUUID);
+    await char.startNotifications();
+    char.addEventListener("characteristicvaluechanged", e=>{
+      const value = new TextDecoder().decode(e.target.value).trim();
+      const parts = value.split(",");
+      if(parts.length >= 2){
+        const pitch = parseFloat(parts[0]);
+        const roll  = parseFloat(parts[1]);
+        const vec   = vector(pitch, roll);
+        if(id === 1){
+          latestRight = [pitch, roll];
+          document.getElementById("values1").textContent =
+            `Pitch:${pitch.toFixed(2)} Roll:${roll.toFixed(2)} 合成:${vec.toFixed(2)}`;
+          dataStore[1].push(pitch);
+          if(dataStore[1].length > maxDataPoints) dataStore[1].shift();
+          drawGraph(1);
+        }else{
+          latestLeft = [pitch, roll];
+          document.getElementById("values2").textContent =
+            `Pitch:${pitch.toFixed(2)} Roll:${roll.toFixed(2)} 合成:${vec.toFixed(2)}`;
+          dataStore[2].push(pitch);
+          if(dataStore[2].length > maxDataPoints) dataStore[2].shift();
+          drawGraph(2);
+        }
+        checkLegCrossed();
+      }
+    });
+    document.getElementById("status"+id).textContent =
+      `${id===1?"右":"左"}足 接続完了`;
+  } catch(e){
+    alert("接続失敗: "+e);
+    btn.disabled = false;
+  }
+}
+/* =======================================
+   ★ キャリブレーション
+   ======================================= */
+function startCalibration(){
+  tempRight = [];
+  tempLeft  = [];
+  isCalibrated = false;
+  let sec = 5;
+  document.getElementById("calibStatus").textContent = `キャリブレーション中…${sec}s`;
+  const timer = setInterval(()=>{
+    tempRight.push([...latestRight]);
+    tempLeft.push([...latestLeft]);
+    sec--;
+    document.getElementById("calibStatus").textContent = `キャリブレーション中…${sec}s`;
+    if(sec <= 0){
+      clearInterval(timer);
+      calibRight.pitch = avg(tempRight.map(v=>v[0]));
+      calibRight.roll  = avg(tempRight.map(v=>v[1]));
+      calibLeft.pitch  = avg(tempLeft.map(v=>v[0]));
+      calibLeft.roll   = avg(tempLeft.map(v=>v[1]));
+      isCalibrated = true;
+      document.getElementById("calibStatus").textContent =
+        `完了：右(P:${calibRight.pitch.toFixed(1)},R:${calibRight.roll.toFixed(1)}) 左(P:${calibLeft.pitch.toFixed(1)},R:${calibLeft.roll.toFixed(1)})`;
+    }
+  },1000);
+}
+function avg(arr){
+  if(arr.length === 0) return 0;
+  return arr.reduce((a,b)=>a+b,0) / arr.length;
+}
+/* =======================================
+   ★ 足組み判定（15/45/90組）
+   ======================================= */
+function checkLegCrossed(){
+  if(!isCalibrated){
+    document.getElementById("result").textContent = "キャリブレーション未実施";
+    return;
+  }
+  const rp = latestRight[0] - calibRight.pitch;
+  const rr = latestRight[1] - calibRight.roll;
+  const lp = latestLeft[0]  - calibLeft.pitch;
+  const lr = latestLeft[1]  - calibLeft.roll;
+  const rVec = vector(rp, rr);
+  const lVec = vector(lp, lr);
+  const sumVec = rVec + lVec;
+  const maxVec = Math.max(rVec, lVec);
+  let crossedText = "足組み状態: 不明";
+  if(sumVec >= THRESH_15*2){       // 両方 +24.524 なら 15組
+    crossedText = "15組";
+  } else if(maxVec >= THRESH_15){  // どちらか +24.524 なら 45組
+    crossedText = "45組";
+  } else if(maxVec >= THRESH_45){  // どちらか +63.679 なら 90組
+    crossedText = "90組";
+  } else {
+    crossedText = "足を組んでいません";
+  }
+  const diff = Math.abs(rVec - lVec);
+  document.getElementById("result").textContent = `${crossedText}（差:${diff.toFixed(2)}）`;
+  accelData.push([
+    new Date().toLocaleTimeString(),
+    rp, rr, rVec,
+    lp, lr, lVec,
+    diff,
+    crossedText
+  ]);
+}
+/* =======================================
+   ★ グラフ描画
+   ======================================= */
+function drawGraph(id){
+  const ctx = document.getElementById("graph"+id).getContext("2d");
+  const data = dataStore[id];
+  const w = ctx.canvas.width, h = ctx.canvas.height;
+  ctx.clearRect(0,0,w,h);
+  ctx.fillStyle="#E0F2F1";
+  ctx.fillRect(0,0,w,h);
+  if(data.length < 2) return;
+  const maxVal = Math.max(...data.map(v=>Math.abs(v))) || 1;
+  const scale = (h/2 - 10) / maxVal;
+  ctx.strokeStyle = id===1 ? "#FF4444" : "#2979FF";
+  ctx.beginPath();
+  data.forEach((v,i)=>{
+    const x = (i/(maxDataPoints-1))*w;
+    const y = h/2 - v*scale;
+    if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+  });
+  ctx.stroke();
+}
+/* =======================================
+   ★ Excel 出力
+   ======================================= */
+function downloadExcel(){
+  const wb = XLSX.utils.book_new();
+  const ws = XLSX.utils.aoa_to_sheet(accelData);
+  XLSX.utils.book_append_sheet(wb, ws, "VectorJudge");
+  XLSX.writeFile(wb, "vector_judge.xlsx");
+}
+</script>
+</body>
+</html>
